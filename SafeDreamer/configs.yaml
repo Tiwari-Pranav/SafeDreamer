@@ -20,7 +20,7 @@ defaults:
     logical_gpus: 0
     debug: False
     policy_devices: [0]
-    train_devices: [0]
+    train_devices: [1,2]
     metrics_every: 10
 
   run:
@@ -63,7 +63,7 @@ defaults:
   # Agent
   task_behavior: Greedy
   expl_behavior: None
-  batch_size: 16
+  batch_size: 64
   batch_length: 64
   data_loaders: 8
 
@@ -127,7 +127,7 @@ bsrp_lag:
   cost_weight: 10.0
   cost_limit: 2.0
   task: safetygym_SafetyPointGoal1-v0
-  envs.amount: 1
+  envs.amount: 8
   env.safetygym: {repeat: 4,render: True, obs_key: 'image', camera_name: 'vision_front_back'}
   run.train_ratio: 512
   pessimistic: True
