@@ -36,7 +36,8 @@ def main(argv=None):
       **config.run, logdir=logdir_algo, use_cost=config.use_cost,
       batch_steps=config.batch_size * config.batch_length)
   print(config)
-  os.environ['CUDA_VISIBLE_DEVICES'] = str(config.jax.logical_gpus)
+  if config.jax.logical_gpus:
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(config.jax.logical_gpus)
 
   logdir = embodied.Path(logdir_algo)
   logdir.mkdirs()
