@@ -15,24 +15,31 @@ class Arrive:
 
 def train_eval(
     agent, train_env, eval_env, train_replay, eval_replay, logger, args, lag):
+  # 1. Setup paths + schedules
   logdir = embodied.Path(args.logdir)
   logdir.mkdirs()
   print('Logdir', logdir)
+  # 2. These are timers/conditions.
   should_expl = embodied.when.Until(args.expl_until)
   should_train = embodied.when.Ratio(args.train_ratio / args.batch_steps)
   should_log = embodied.when.Clock(args.log_every)
   should_save = embodied.when.Clock(args.save_every)
   should_eval = embodied.when.Every(args.eval_every, args.eval_initial)
   should_sync = embodied.when.Every(args.sync_every)
+  # 3. This is the global training step counter
   step = logger.step
+  # 4. Just containers for logging stats.
   cost_ema = CostEma(0.0)
   train_arrive_num = Arrive()
   eval_arrive_num = Arrive()
+  # 5. Counters for number of gradient updates or accumulated metrics
   updates = embodied.Counter()
   metrics = embodied.Metrics()
+  # 6. Print the observation and actions space
   print('Observation space:', embodied.format(train_env.obs_space), sep='\n')
   print('Action space:', embodied.format(train_env.act_space), sep='\n')
 
+  # 7. Timer wrapping or profiling
   timer = embodied.Timer()
   timer.wrap('agent', agent, ['policy', 'train', 'report', 'save'])
   timer.wrap('env', train_env, ['step'])
@@ -40,7 +47,9 @@ def train_eval(
     timer.wrap('replay', train_replay, ['_sample'])
 
   nonzeros = set()
+  # 8. Episode Logging Function
   def per_episode(ep, mode):
+    # 8.1 Episode length and score(return)
     length = len(ep['reward']) - 1
     score = float(ep['reward'].astype(np.float64).sum())
     logger.add({
@@ -48,6 +57,7 @@ def train_eval(
         'score': score,
     }, prefix=('episode' if mode == 'train' else f'{mode}_episode'))
     print(f'Episode has {length} steps and return {score:.1f}.')
+    # 8.2 Episode safety cost
     if 'cost' in ep.keys():
       cost = float(ep['cost'].astype(np.float64).sum())
       logger.add({
@@ -55,12 +65,15 @@ def train_eval(
       }, prefix=('episode' if mode == 'train' else f'{mode}_episode'))
       print(f'Episode has {length} steps and  cost {cost:.1f}.')
       # lag.add_cost(cost)
+      # cost_ema = smoothed cost.
       cost_ema.value = cost_ema.value * 0.99 + cost * 0.01
       logger.add({
           'cost_ema': cost_ema.value,
       }, prefix=('episode' if mode == 'train' else f'{mode}_episode'))
+      # 8.3 PID safety multiplier PID safety multiplier
       if step > 5000:
         lag.pid_update(cost_ema.value, step)
+    # 9. Tracks success rate across 10 episodes.
     if 'arrive_dest' in ep.keys():
       if mode == 'train':
         train_arrive_num.value.append(int(ep['arrive_dest'][-1]))
@@ -83,6 +96,7 @@ def train_eval(
           print(f'eval 10 episodes has average arrive rate {arrive_rate:.2f}.')
 
 
+    # 10. Adds metrics to logger
     stats = {}
     for key in args.log_keys_video:
       if key in ep:
@@ -99,6 +113,7 @@ def train_eval(
         stats[f'max_{key}'] = ep[key].max(0).mean()
     metrics.add(stats, prefix=f'{mode}_stats')
 
+  # 11. Drivers — Environment Runners
   driver_train = embodied.Driver(train_env)
   driver_train.on_episode(lambda ep, worker: per_episode(ep, mode='train'))
   driver_train.on_step(lambda tran, _: step.increment())
@@ -107,6 +122,7 @@ def train_eval(
   driver_eval.on_step(eval_replay.add)
   driver_eval.on_episode(lambda ep, worker: per_episode(ep, mode='eval'))
 
+  # 12. Prefill Replay Buffer : Train world model on random actions first
   random_agent = embodied.RandomAgent(train_env.act_space)
   print('Prefill train dataset.')
   while len(train_replay) < max(args.batch_steps, args.train_fill):
@@ -117,21 +133,30 @@ def train_eval(
   logger.add(metrics.result())
   logger.write()
 
+  # 13. Dataset Iterators
   dataset_train = agent.dataset(train_replay.dataset)
   dataset_eval = agent.dataset(eval_replay.dataset)
   state = [None]  # To be writable from train step function below.
   batch = [None]
+  # 14. Training Step Function
   def train_step(tran, worker):
+    # 14.1 Decide how many updates now
     for _ in range(should_train(step)):
       with timer.scope('dataset_train'):
+        # 14.2 Fetch a training batch
         batch[0] = next(dataset_train)
+      # 14.3 Train the agent
       outs, state[0], mets = agent.train(batch[0], state[0])
       metrics.add(mets, prefix='train')
       if 'priority' in outs:
         train_replay.prioritize(outs['key'], outs['priority'])
+      # 14.5 Tracks number of gradient steps taken.
       updates.increment()
     if should_sync(updates):
+      # [ online network   → updated every gradient step
+      #   target network   → updated slowly ]
       agent.sync()
+    # 14.6 Sample evaluation batch and log all metrics
     if should_log(step):
       logger.add(metrics.result())
       logger.add(agent.report(batch[0]), prefix='report')
@@ -142,6 +167,7 @@ def train_eval(
       logger.add(eval_replay.stats, prefix='eval_replay')
       logger.add(timer.stats(), prefix='timer')
       logger.write(fps=True)
+  # 15. Register train_step as a callback.
   driver_train.on_step(train_step)
 
   checkpoint = embodied.Checkpoint(logdir / 'checkpoint.ckpt')
@@ -151,19 +177,25 @@ def train_eval(
   checkpoint.eval_replay = eval_replay
   if args.from_checkpoint:
     checkpoint.load(args.from_checkpoint)
+  # 16. If checkpoint exists then load it else create a new checkpoint
   checkpoint.load_or_save()
   should_save(step)  # Register that we jused saved.
 
   print('Start training loop.')
+  # 17. This dynamically switches behavior.
   policy_train = lambda *args: agent.policy(
       *args, mode='explore' if should_expl(step) else 'train')
   policy_eval = lambda *args: agent.policy(*args, mode='eval')
+  # 18. Training loop
   while step < args.steps:
+    # 18.1 Scheduler decides if it is evaluation time.
     if should_eval(step):
       print('Starting evaluation at step', int(step))
       driver_eval.reset()
       driver_eval(policy_eval, episodes=max(len(eval_env), args.eval_eps), lag=lag.lagrange_penalty, lag_p=lag.delta_p, lag_i=lag.pid_i, lag_d=lag.pid_d)
+    # 18.2 Train driver execution initiate
     driver_train(policy_train, steps=100, lag=lag.lagrange_penalty, lag_p=lag.delta_p, lag_i=lag.pid_i, lag_d=lag.pid_d)
+    # 18.1 Scheduler decides if it is saving time.
     if should_save(step):
       checkpoint.save()
   logger.write()
