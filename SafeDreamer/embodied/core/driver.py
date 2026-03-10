@@ -27,7 +27,13 @@ class Driver:
         k: convert(np.zeros((len(self._env),) + v.shape, v.dtype))
         for k, v in self._env.act_space.items()}
     self._acts['reset'] = np.ones(len(self._env), bool)
+    # _acts = {
+    #  '...' : 0_{N_envs, dim}
+    #  'reset' : array([ True,  True, ... N times])
+    # }
     self._eps = [collections.defaultdict(list) for _ in range(len(self._env))]
+    # _eps = list of episode buffers, one per env
+    # [defaultdict(list), defaultdict(list), ... N times]
     self._state = None
 
   def on_step(self, callback):
@@ -42,9 +48,15 @@ class Driver:
       step, episode = self._step(policy, step, episode, lag, lag_p, lag_i, lag_d)
 
   def _step(self, policy, step, episode, lag, lag_p, lag_i, lag_d):
+    # Check action shapes: ensure we have one action per environment
     assert all(len(x) == len(self._env) for x in self._acts.values())
+    # Driver removes logging keys. So env only receives real actions.
     acts = {k: v for k, v in self._acts.items() if not k.startswith('log_')}
+    # STEP the all N environments
+    # [ Dreamer: env.step(previous_action) -> new_observation 
+    #   policy(new_observation, ...) -> new action ]
     obs = self._env.step(acts)
+    # adds safety info into observation dictionary
     obs['lagrange_penalty'] = lag * np.ones(len(self._env))
     obs['lagrange_p'] = lag_p * np.ones(len(self._env))
     obs['lagrange_i'] = lag_i * np.ones(len(self._env))
@@ -52,23 +64,34 @@ class Driver:
 
     obs = {k: convert(v) for k, v in obs.items()}
     assert all(len(x) == len(self._env) for x in obs.values()), obs
+    # CALL POLICY : new_action, new_state = policy (...)
     acts, self._state = policy(obs, self._state, **self._kwargs)
     acts = {k: convert(v) for k, v in acts.items()}
+    # Mask finished environments
     if obs['is_last'].any():
       mask = 1 - obs['is_last']
+      # zero out actions for envs that just finished.
       acts = {k: v * self._expand(mask, len(v.shape)) for k, v in acts.items()}
     acts['reset'] = obs['is_last'].copy()
     self._acts = acts
+    # Build transition dict
     trns = {**obs, **acts}
+    # Reset episode buffer if new episode starts
     if obs['is_first'].any():
+      # "the transition we just received belongs to a NEW episode => clear stored episode trajectory of corresponding env's"
       for i, first in enumerate(obs['is_first']):
         if first:
           self._eps[i].clear()
+    # LOOP OVER EACH ENVIRONMENT : Replay buffer and callbacks operate on SINGLE transitions.
     for i in range(len(self._env)):
       trn = {k: v[i] for k, v in trns.items()}
+      # append current step trn data into corresponding env’s episode buffer.
       [self._eps[i][k].append(v) for k, v in trn.items()]
+      # Execute all on_step CALLBACKS.
       [fn(trn, i, **self._kwargs) for fn in self._on_steps]
+      # One step_counter++ (for each env)
       step += 1
+    # Episode termination: on_episode CALLBACKS + episode_counter++
     if obs['is_last'].any():
       for i, done in enumerate(obs['is_last']):
         if done:

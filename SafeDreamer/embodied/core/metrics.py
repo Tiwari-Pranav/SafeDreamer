@@ -5,6 +5,39 @@ import numpy as np
 
 
 class Metrics:
+  """
+  Lightweight metric aggregation utility used during training and evaluation.
+  This class is heavily used in the training loop to accumulate metrics between logging intervals, reducing logging overhead.
+
+  Attributes:
+      _scalars (defaultdict[list]):
+          Mapping from metric name to a list of scalar values collected since
+          the last reset. Aggregated via mean in `result()`.
+          - Stores lists of numeric values.
+          - When `result()` is called, their mean value is returned.
+          - Used for losses, rewards, costs, returns, etc.
+
+      _lasts (dict):
+          Mapping from metric name to the latest tensor-like value (e.g. images, videos, arrays). These overwrite previous entries.
+          - Stores only the most recent value for non-scalar data.
+          - Typically images, videos, or arrays that should not be averaged.
+          - Passed directly to the logger unchanged.
+
+  Methods:
+      add(mapping, prefix=None):
+          Add multiple metrics at once from a dictionary.
+          Scalars are appended to `_scalars`, while arrays/tensors are stored
+          as last values in `_lasts`. An optional prefix can be added to keys.
+
+      result(reset=True):
+          Returns a dictionary containing:
+              - mean of all scalar metrics
+              - latest tensor metrics
+          Optionally clears internal buffers after aggregation.
+
+      reset():
+          Clears all stored metrics.
+  """
 
   def __init__(self):
     self._scalars = collections.defaultdict(list)

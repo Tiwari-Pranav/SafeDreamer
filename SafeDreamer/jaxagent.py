@@ -24,14 +24,19 @@ def Wrapper(agent_cls):
 class JAXAgent(embodied.Agent):
 
   def __init__(self, agent_cls, obs_space, act_space, step, config):
+    # Only JAX-specific settings.
     self.config = config.jax
+    # Data loading parameters
     self.batch_size = config.batch_size
     self.batch_length = config.batch_length
     self.data_loaders = config.data_loaders
+    # Setup runtime: disables TensorFlow GPU grabbing, configures XLA memory, sets JAX precision
     self._setup()
+    # dreamer implementation
     self.agent = agent_cls(obs_space, act_space, step, config, name='agent')
     self.rng = np.random.default_rng(config.seed)
 
+    # device selection
     available = jax.devices(self.config.platform)
     self.policy_devices = [available[i] for i in self.config.policy_devices]
     self.train_devices = [available[i] for i in self.config.train_devices]

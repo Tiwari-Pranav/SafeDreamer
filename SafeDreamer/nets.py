@@ -1,3 +1,7 @@
+# nets.py contains neural network components used by the world
+# model and policy modules.  It defines the RSSM dynamics, encoder/
+# decoder architectures, MLPs for actor/critic, and distribution
+# helpers that wrap tensorflow‑probability.  
 import re
 
 import jax
@@ -14,14 +18,17 @@ from . import ninjax as nj
 cast = jaxutils.cast_to_compute
 
 
+# Recurrent state-space model (RSSM) implementing latent dynamics
+# used by the world model.  It supports both stochastic and
+# deterministic components and provides observe/imagine helpers.
 class RSSM(nj.Module):
 
   def __init__(
       self, deter=1024, stoch=32, classes=32, unroll=False, initial='learned',
       unimix=0.01, action_clip=1.0, **kw):
-    self._deter = deter
-    self._stoch = stoch
-    self._classes = classes
+    self._deter = deter # deterministic hidden state size (gru)
+    self._stoch = stoch # stochastic state size (gaussian or categorical)
+    self._classes = classes # number of classes for categorical state; if 0, use gaussian
     self._unroll = unroll
     self._initial = initial
     self._unimix = unimix
@@ -29,23 +36,28 @@ class RSSM(nj.Module):
     self._kw = kw
 
   def initial(self, bs):
+    # bs = batch size (number of parallel environments)
     if self._classes:
+      # For categorical stochastic state
       state = dict(
           deter=jnp.zeros([bs, self._deter], f32),
           logit=jnp.zeros([bs, self._stoch, self._classes], f32),
           stoch=jnp.zeros([bs, self._stoch, self._classes], f32))
     else:
+      # For gaussian stochastic state
       state = dict(
           deter=jnp.zeros([bs, self._deter], f32),
           mean=jnp.zeros([bs, self._stoch], f32),
           std=jnp.ones([bs, self._stoch], f32),
           stoch=jnp.zeros([bs, self._stoch], f32))
     if self._initial == 'zeros':
-      return cast(state)
+      # zeros initialization
+      return cast(state) 
     elif self._initial == 'learned':
-      deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32)
-      state['deter'] = jnp.repeat(jnp.tanh(deter)[None], bs, 0)
-      state['stoch'] = self.get_stoch(cast(state['deter']))
+      # Learnable initial state: we make the deterministic part learnable and compute the stochastic part from it.
+      deter = self.get('initial', jnp.zeros, state['deter'][0].shape, f32) # learnable initial deterministic state ∈ R^_deter
+      state['deter'] = jnp.repeat(jnp.tanh(deter)[None], repeats=bs, axis=0) # repeat for batch size
+      state['stoch'] = self.get_stoch(cast(state['deter'])) # compute initial stochastic state from deterministic state
       return cast(state)
     else:
       raise NotImplementedError(self._initial)
@@ -81,51 +93,95 @@ class RSSM(nj.Module):
       return tfd.MultivariateNormalDiag(mean, std)
 
   def obs_step(self, prev_state, prev_action, embed, is_first):
-    is_first = cast(is_first)
-    prev_action = cast(prev_action)
+    ''' The observe step computes the posterior and prior states at time t given the previous state, action, and current observation embedding. 
+    Args:
+      prev_state: a dict {'deter': h_{t-1}, 'stoch': z_{t-1}, stats} (where stats can be mean and std for gaussian state or logit for categorical state)
+      prev_action: the previous action a_{t-1}
+      embed: the current observation embedding
+      is_first: a boolean tensor indicating which steps are the first step of each episode
+    Returns:
+      post: the posterior state at time t 
+      prior: the prior state at time t
+    '''
+    is_first = cast(is_first) # dim: (batch_size,)
+    prev_action = cast(prev_action) # dim: (batch_size, action_dim)
+    # 1. Prevent exploding actions by clipping them to a maximum magnitude.
     if self._action_clip > 0.0:
       prev_action *= sg(self._action_clip / jnp.maximum(
           self._action_clip, jnp.abs(prev_action)))
+    # 2. Mask out the previous state and action for the first step of each episode, and replace them with the initial state.
+    #    Prev_state = prev_state * (1 - is_first) + initial_state * is_first
+    #    implies:: state = initial_state if is_first else previous_state
     prev_state, prev_action = jax.tree_util.tree_map(
         lambda x: self._mask(x, 1.0 - is_first), (prev_state, prev_action))
     prev_state = jax.tree_util.tree_map(
         lambda x, y: x + self._mask(y, is_first),
         prev_state, self.initial(len(is_first)))
+    # 3. Compute prior latent state using the dynamics model.
+    #     h_t, hat_z_t = img_step(prev_state, prev_action)  
     prior = self.img_step(prev_state, prev_action)
+    # 4. Posterior inference network.
+    # concatenate(h_t, o_t) -> (batch_size, deter + embed_dim) where o_t=embed is the encoded observation at time t 
     x = jnp.concatenate([prior['deter'], embed], -1)
+    # 5. Posterior network predicts posterior stochastic state z_t ~ q(z_t | h_t, o_t)
+    # input x -> linear layer -> stats -> get_dist -> posterior distribution q(z_t | h_t, o_t) +> sample z_t
     x = self.get('obs_out', Linear, **self._kw)(x)
     stats = self._stats('obs_stats', x)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
     post = {'stoch': stoch, 'deter': prior['deter'], **stats}
+    # 6. Return both posterior and prior states for use in loss computation and imagination.
     return cast(post), cast(prior)
 
   def img_step(self, prev_state, prev_action):
+    ''' The image step computes the next prior state given the previous state and action, without conditioning on the current observation. It is used for both computing the prior in the observe step and for imagination. The dynamics model is as follows:
+    1. h_t = GRU(h_{t-1}, concat(z_{t-1}, a_{t-1}))    # deterministic state update
+    2. hat_z_t ~ p(z_t | h_t)                          # prior stochastic state computed from the new deterministic state
+    Args:
+    prev_state: dict containing the previous deterministic and stochastic states, e.g. {'deter': h_{t-1}, 'stoch': z_{t-1}, stats} (where stats can be mean and std for gaussian state or logit for categorical state)
+    prev_action: the previous action a_{t-1}
+    Returns:
+    prior: dict {'deter': h_t, 'stoch': z_t, stats} (where stats can be mean and std for gaussian state or logit for categorical state) representing the prior state at time t computed from the dynamics model.
+    '''
     prev_stoch = prev_state['stoch']
     prev_action = cast(prev_action)
+    # 1. Prevent exploding actions by clipping them to a maximum magnitude. 
     if self._action_clip > 0.0:
       prev_action *= sg(self._action_clip / jnp.maximum(
           self._action_clip, jnp.abs(prev_action)))
+    # 2. If the stochastic state is categorical, we need to flatten it before concatenating with the action.
     if self._classes:
       shape = prev_stoch.shape[:-2] + (self._stoch * self._classes,)
-      prev_stoch = prev_stoch.reshape(shape)
+      prev_stoch = prev_stoch.reshape(shape) # Dim: (batch_size, stoch * classes)
+    # 3. If the action is 2D, we need to flatten it before concatenating with the stochastic state.
     if len(prev_action.shape) > len(prev_stoch.shape):  # 2D actions.
       shape = prev_action.shape[:-2] + (np.prod(prev_action.shape[-2:]),)
-      prev_action = prev_action.reshape(shape)
+      prev_action = prev_action.reshape(shape) # Dim: (batch_size, action_dim=R^(...)) -> (batch_size, action_dim_flat)
+    # 4. X = concatenate(prev_stoch, prev_action) -> (batch_size, stoch * classes + action_dim_flat)
     x = jnp.concatenate([prev_stoch, prev_action], -1)
+    # 5. X (z_{t-1}, a_{t-1}) → linear layer → X i.e. GRU input
     x = self.get('img_in', Linear, **self._kw)(x)
+    # 6. X, h_{t-1} → GRU → h_t, h_t (new deterministic state)
     x, deter = self._gru(x, prev_state['deter'])
+    # 7. h_t → linear layer → X (input for computing stats of stochastic state)
     x = self.get('img_out', Linear, **self._kw)(x)
+    # 8. X → stats (mean/std for gaussian or logit for categorical)
     stats = self._stats('img_stats', x)
+    # 9. stats → distribution → stoch hat_z_t (sampled stochastic state)
     dist = self.get_dist(stats)
     stoch = dist.sample(seed=nj.rng())
+    # 10. New state = {stoch, deter, stats}
     prior = {'stoch': stoch, 'deter': deter, **stats}
     return cast(prior)
 
   def get_stoch(self, deter):
+    # deter → linear layer → x
     x = self.get('img_out', Linear, **self._kw)(deter)
+    # x → stats (mean/std for gaussian or logit for categorical)
     stats = self._stats('img_stats', x)
+    # stats → distribution → stoch (sampled stochastic state)
     dist = self.get_dist(stats)
+    # For initial state, we can use the mode of the distribution instead of sampling to get a deterministic initial state.
     return cast(dist.mode())
 
   def _gru(self, x, deter):
@@ -141,8 +197,10 @@ class RSSM(nj.Module):
 
   def _stats(self, name, x):
     if self._classes:
+      # For categorical state, output logits of shape (..., stoch, classes)
+      # X -> linear layer --> x of shape (..., stoch * classes)
       x = self.get(name, Linear, self._stoch * self._classes)(x)
-      logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes))
+      logit = x.reshape(x.shape[:-1] + (self._stoch, self._classes)) # reshape to get logits
       if self._unimix:
         probs = jax.nn.softmax(logit, -1)
         uniform = jnp.ones_like(probs) / probs.shape[-1]
@@ -151,12 +209,20 @@ class RSSM(nj.Module):
       stats = {'logit': logit}
       return stats
     else:
+      # For gaussian state, output mean and std of shape (..., stoch)
+      # X -> linear layer --> x of shape (..., 2 * stoch) --> mean & std
       x = self.get(name, Linear, 2 * self._stoch)(x)
-      mean, std = jnp.split(x, 2, -1)
+      mean, std = jnp.split(x, 2, -1) # split to get mean and std
       std = 2 * jax.nn.sigmoid(std / 2) + 0.1
       return {'mean': mean, 'std': std}
 
   def _mask(self, value, mask):
+    ''' It performs an element-wise multiplication between a 3D+ tensor (value) and a 1D mask (mask) along the first (batch) dimension.
+    Args:
+      value: a tensor of shape (batch_size, ...), mask: a tensor of shape (batch_size,)
+    Returns:
+       A tensor of the same shape as value, where the entries corresponding to mask=0 are set to zero, and the entries corresponding to mask=1 are unchanged.
+    '''
     return jnp.einsum('b...,b->b...', value, mask.astype(value.dtype))
 
   def dyn_loss(self, post, prior, impl='kl', free=1.0):
@@ -187,6 +253,8 @@ class RSSM(nj.Module):
     return loss
 
 
+# MultiEncoder combines convolutional and MLP encoders to process
+# mixed observation modalities (images, vectors).
 class MultiEncoder(nj.Module):
 
   def __init__(
@@ -237,6 +305,8 @@ class MultiEncoder(nj.Module):
     return outputs
 
 
+# MultiDecoder produces distributions over observations from latent
+# features; used for reconstruction and imagination.
 class MultiDecoder(nj.Module):
 
   def __init__(
@@ -401,6 +471,8 @@ class ImageDecoderResnet(nj.Module):
     return x
 
 
+# Generic fully‑connected multi‑layer perceptron that can output
+# parameterised distributions.  Used for policies, critics, heads, etc.
 class MLP(nj.Module):
 
   def __init__(
@@ -441,6 +513,9 @@ class MLP(nj.Module):
     return self.get(f'dist_{name}', Dist, shape, **self._dist)(x)
 
 
+# Distribution factory used by MLP to produce tensorflow‑probability
+# distributions with various parameterisations (normal, categorical,
+# etc.).
 class Dist(nj.Module):
 
   def __init__(
