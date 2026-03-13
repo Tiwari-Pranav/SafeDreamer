@@ -20,7 +20,7 @@ defaults:
     logical_gpus: 0
     debug: False
     policy_devices: [0]
-    train_devices: [1,2]
+    train_devices: [0,1,2]
     metrics_every: 10
 
   run:
@@ -63,7 +63,7 @@ defaults:
   # Agent
   task_behavior: Greedy
   expl_behavior: None
-  batch_size: 64
+  batch_size: 192
   batch_length: 64
   data_loaders: 8
 
@@ -143,7 +143,7 @@ bsrp_lag:
   .*\.units: 512
   .*\.mlp_units: 1024
   .*\.mlp_layers: 5
-  rssm: {stoch: 48, classes: 48}
+  rssm: {stoch: 32, classes: 32}
   encoder: {mlp_keys: '.*', cnn_keys: 'image|image2'}
   decoder: {mlp_keys: '.*', cnn_keys: 'image|image2'}
 
